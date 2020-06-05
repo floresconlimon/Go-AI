@@ -313,6 +313,11 @@ class Gamestate(namedtuple('Gamestate', ['player', 'position','prev_state','last
         candidates.append(Move.resign())
         return candidates
 
+    def fills_eye(self, move):
+        if move.is_play:
+            return self.position.board.is_eye(move.fcord, self.player)
+        return False
+
     def count_score(self):
         return self.position.score()
 
@@ -396,7 +401,7 @@ class MCTSNode(object):
         }
         self.num_rollouts = 0
         self.children = []
-        self.unvisited_moves = gamestate.legal_moves()
+        self.unvisited_moves = [m for m in gamestate.legal_moves() if not gamestate.fills_eye(m)]
 
     def add_random_child(self):
         index = random.randint(0, len(self.unvisited_moves)-1)
