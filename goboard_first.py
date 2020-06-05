@@ -4,10 +4,12 @@ import numpy as np
 import random
 import enum
 from copy import deepcopy
+import time
+import math
 
-DEFAULT_BOARD_SIZE = 9
+DEFAULT_BOARD_SIZE = 5 
 BLACK, WHITE, EMPTY = 'O', 'X', '.'
-KOMI = 7.5
+KOMI = 0
 
 def swap_colors(color):
     if color == BLACK:
@@ -67,9 +69,9 @@ class Move():
 
 #Maybe encode neighbors with the board to speed up calculations?
 class Board:
-    def __init__(self, size=DEFAULT_BOARD_SIZE):
-        self.size = size 
-        self.state = (size*size) * EMPTY
+    def __init__(self, size=DEFAULT_BOARD_SIZE, state=(DEFAULT_BOARD_SIZE*DEFAULT_BOARD_SIZE)* EMPTY):
+        self.size = size
+        self.state = state
         self.neighbors = [get_valid_neighbors(size, fc) for fc in range(size*size)]
 # chain consists of all reachable point of the same color (or empty)
 # reached consists of the chain's neigborhood
@@ -89,7 +91,7 @@ class Board:
         return chain, reached
 
     def place_stone(self, color, fc):
-        return self.state[:fc] + color + self.state[fc+1:]
+        return Board(self.size, self.state[:fc] + color + self.state[fc+1:])
 
     def output_as_matrix(self):
         mat = np.array(list(self.state))
@@ -115,7 +117,7 @@ class Board:
     def play_move_incomplete(self, fc, color):
         if self.state[fc] != EMPTY:
             raise IllegalMove
-        self.state = place_stone(self, color, fc)
+        self.state = place_stone(self, color, fc).state
 
         opp_color = swap_colors(color)
         opp_stones = []
@@ -125,7 +127,7 @@ class Board:
                 my_stones.append(fn)
             elif self.state[fn] == opp_color:
                 opp_stones.append(fn)
-        
+
         for fs in opp_stones:
             self.state, _ = maybe_capture_stones(self, fs)
 
@@ -197,9 +199,7 @@ class Position(namedtuple('Position', ['board', 'ko'])):
             return False
 
         possible_ko_color = board.is_koish(fc)
-        bord = Board()
-        bord.state = board.state
-        bord.state = bord.place_stone(color, fc)
+        bord = board.place_stone(color, fc)
 
         opp_color = swap_colors(color)
         opp_stones = []
@@ -231,7 +231,7 @@ class Position(namedtuple('Position', ['board', 'ko'])):
 
         possible_kos = []
         possible_ko_color = board.is_koish(fc)
-        board.state = board.place_stone(color, fc)
+        board = board.place_stone(color, fc)
 
         opp_color = swap_colors(color)
         opp_stones = []
@@ -262,10 +262,12 @@ class Position(namedtuple('Position', ['board', 'ko'])):
         return self.play_move(flat_cord(self.board.size, (x-1,y-1)),color)
 
     def score(self):
-        board = self.board
+        board = Board(self.board.size,self.board.state)
         while EMPTY in board.state:
             fempty = board.state.index(EMPTY)
             empties, borders = board.find_reached(fempty)
+            if not borders:
+                return 0
             possible_border_color = board.state[list(borders)[0]]
             if all(board.state[fb] == possible_border_color for fb in borders):
                 board.state = board.bulk_place_stones(possible_border_color, empties)
@@ -305,8 +307,10 @@ class Gamestate(namedtuple('Gamestate', ['player', 'position','prev_state','last
     def legal_moves(self):
         candidates =[]
         for fn in range(pow(self.position.board.size,2)):
-            if self.position.is_valid(fn, self.player):
-                candidates.append(fn)
+            if self.position.is_valid_move(fn, self.player):
+                candidates.append(Move.play(fn))
+        candidates.append(Move.pass_turn())
+        candidates.append(Move.resign())
         return candidates
 
     def count_score(self):
@@ -340,11 +344,11 @@ class Agent:
         raise NotImplementedError()
 
 class RandomBot(Agent):
-    def select_move(self, position, color):
+    def select_move(self, gamestate):
         """Random move besides not filling your own eyes"""
         candidates = []
-        for fr in range(position.board.size*position.board.size):
-            if position.is_valid_move(fr,color) and not position.board.is_eye(fr, color):
+        for fr in range(gamestate.position.board.size*gamestate.position.board.size):
+            if gamestate.position.is_valid_move(fr,gamestate.player) and not gamestate.position.board.is_eye(fr, gamestate.player):
                 candidates.append(fr)
         if not candidates:
             return Move.pass_turn()
@@ -359,7 +363,7 @@ def TestKo():
     G.apply_move(M)
 
 
-def simulate_random_game(gamestate):
+def simulate_random_game_from_gamestate(gamestate):
     G = gamestate
     r = RandomBot()
     pass_count = 0
@@ -387,8 +391,8 @@ class MCTSNode(object):
         self.parent = parent
         self.move = move
         self.win_counts = {
-            black : 0,
-            white : 0,
+            BLACK : 0,
+            WHITE : 0,
         }
         self.num_rollouts = 0
         self.children = []
@@ -397,7 +401,7 @@ class MCTSNode(object):
     def add_random_child(self):
         index = random.randint(0, len(self.unvisited_moves)-1)
         new_move = self.unvisited_moves.pop(index)
-        new_game_state = self.gamestate.apply_move(new_move)
+        new_gamestate = self.gamestate.apply_move(new_move)
         new_node = MCTSNode(new_gamestate, self, new_move)
         self.children.append(new_node)
         return new_node
@@ -415,7 +419,16 @@ class MCTSNode(object):
     def winning_frac(self, color):
         return float(self.win_counts[color]) / float(self.num_rollouts)
 
+def uct_score(parent_rollouts, child_rollouts, win_pct, temperature):
+    exploration = math.sqrt(math.log(parent_rollouts) / child_rollouts)
+    return win_pct + temperature * exploration
+
 class MCTSAgent(Agent):
+    def __init__(self, num_rounds, temperature):
+        Agent.__init__(self)
+        self.num_rounds = num_rounds
+        self.temperature = temperature
+
     def select_move(self,gamestate):
         root = MCTSNode(gamestate)
 
@@ -427,8 +440,41 @@ class MCTSAgent(Agent):
             if node.can_add_child():
                 node = node.add_random_child()
 
-            winner = self.simulate_random_game(node.game_state)
+            winner = self.simulate_random_game(node.gamestate)
 
             while node is not None:
                 node.record_win(winner)
                 node = node.parent
+
+        best_move = None
+        best_pct = -1.0
+        for child in root.children:
+            child_pct = child.winning_frac(gamestate.player)
+            if child_pct > best_pct:
+                best_pct = child_pct
+                best_move = child.move
+        return best_move
+
+    def select_child(self, node):
+        total_rollouts = sum(child.num_rollouts for child in node.children)
+
+        best_score = -1
+        best_child = None
+        for child in node.children:
+            score = uct_score(
+                total_rollouts,
+                child.num_rollouts,
+                child.winning_frac(node.gamestate.player),
+                self.temperature)
+            if score > best_score:
+                best_score = score
+                best_child = child
+        return best_child
+
+    @staticmethod
+    def simulate_random_game(game):
+        R = RandomBot()
+        while not game.is_over():
+            bot_move = R.select_move(game)
+            game = game.apply_move(bot_move)
+        return game.winner()
